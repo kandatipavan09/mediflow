@@ -1,9 +1,20 @@
 const http = require('http');
-const autocannon = require('autocannon');
 const fs = require('fs');
 const path = require('path');
 
-const BASE_URL = process.env.BASE_URL || 'http://localhost:5000';
+// STRICT SAFETY GUARD: Restrict load testing strictly to localhost/127.0.0.1
+const rawBase = process.env.BASE_URL || 'http://localhost:5000';
+let parsedUrl;
+try {
+  parsedUrl = new URL(rawBase);
+} catch {
+  parsedUrl = new URL('http://localhost:5000');
+}
+if (parsedUrl.hostname !== 'localhost' && parsedUrl.hostname !== '127.0.0.1') {
+  console.warn(`[SAFETY] External BASE_URL (${rawBase}) rejected for load testing. Forcing to http://localhost:5000`);
+  parsedUrl = new URL('http://localhost:5000');
+}
+const BASE_URL = parsedUrl.origin;
 
 function measureEndpoint(pathUrl) {
   return new Promise((resolve) => {
@@ -32,36 +43,54 @@ function measureEndpoint(pathUrl) {
   });
 }
 
+async function warmUpServer() {
+  console.log('Sending warm-up requests to prime caches and JIT compiler...');
+  for (const ep of ['/api/health', '/api/doctors', '/api/locations', '/api/healthcare/status']) {
+    try {
+      await measureEndpoint(ep);
+    } catch {}
+  }
+  console.log('Server warmed up successfully.\n');
+}
+
 async function runAllLoadTests() {
   console.log('========================================================');
   console.log('⚡ EXECUTING COMPREHENSIVE LOAD & PERFORMANCE SUITE (500 CASES)');
-  console.log(`Target: ${BASE_URL}`);
+  console.log(`Target: ${BASE_URL} (Controlled Local Test Environment)`);
   console.log('========================================================\n');
 
-  // 1. Run sustained baseline benchmark with Autocannon (100 VUs)
-  console.log('Running primary 100 VUs Autocannon benchmark...');
-  const acResult = await new Promise((resolve) => {
-    const instance = autocannon({
-      url: `${BASE_URL}/api/doctors?location=Chennai`,
-      connections: 100,
-      duration: 10,
-      pipelining: 1,
-      requests: [
-        { method: 'GET', path: '/api/health' },
-        { method: 'GET', path: '/api/locations' },
-        { method: 'GET', path: '/api/doctors?location=Chennai' },
-        { method: 'GET', path: '/api/healthcare/status' }
-      ]
+  await warmUpServer();
+
+  // 1. Run sustained baseline benchmark with Autocannon (100 VUs) if installed
+  let acResult = null;
+  try {
+    const autocannon = require('autocannon');
+    console.log('Running primary 100 VUs Autocannon benchmark...');
+    acResult = await new Promise((resolve) => {
+      const instance = autocannon({
+        url: `${BASE_URL}/api/doctors?location=Chennai`,
+        connections: 100,
+        duration: 10,
+        pipelining: 1,
+        requests: [
+          { method: 'GET', path: '/api/health' },
+          { method: 'GET', path: '/api/locations' },
+          { method: 'GET', path: '/api/doctors?location=Chennai' },
+          { method: 'GET', path: '/api/healthcare/status' }
+        ]
+      });
+      instance.on('done', resolve);
     });
-    instance.on('done', resolve);
-  });
 
-  console.log(`- Total Benchmark Requests: ${acResult.requests.total}`);
-  console.log(`- Average Throughput: ${acResult.requests.average} req/s`);
-  console.log(`- Mean Latency: ${acResult.latency.average} ms`);
-  console.log(`- Error Rate: ${acResult.errors || 0} errors\n`);
+    console.log(`- Total Benchmark Requests: ${acResult.requests.total}`);
+    console.log(`- Average Throughput: ${acResult.requests.average} req/s`);
+    console.log(`- Mean Latency: ${acResult.latency.average} ms`);
+    console.log(`- Error Rate: ${acResult.errors || 0} errors\n`);
+  } catch (err) {
+    console.log('ℹ️ Autocannon benchmark skipped (not installed); proceeding to 500-endpoint SLA latency suite.\n');
+  }
 
-  // 2. Iterate through all 500 test cases across categories
+  // 2. Iterate through all 500 test cases across categories with justified SLAs
   const categories = [
     { name: 'Gateway Health & Readiness Latency', count: 50, endpoint: '/api/health', sla: 50 },
     { name: 'Doctor Directory Concurrency & Query Throughput', count: 80, endpoint: '/api/doctors', sla: 100 },
@@ -83,7 +112,7 @@ async function runAllLoadTests() {
     for (let i = 1; i <= cat.count; i++) {
       const testId = `TC-LOAD-${String(testIndex++).padStart(3, '0')}`;
       const sample = await measureEndpoint(cat.endpoint);
-      const pass = sample.success && sample.latencyMs < (cat.sla * 5); // Safe threshold
+      const pass = sample.success && sample.latencyMs < cat.sla;
 
       results.push({
         id: testId,
@@ -109,6 +138,12 @@ async function runAllLoadTests() {
   console.log('========================================================\n');
 
   fs.writeFileSync(path.join(__dirname, 'load_results.json'), JSON.stringify(finalResults, null, 2));
+
+  if (failedCount > 0) {
+    console.error(`❌ Load/Performance Suite FAILED: ${failedCount} request(s) failed or exceeded SLA latency threshold.`);
+    process.exit(1);
+  }
+
   return { results: finalResults, benchmark: acResult };
 }
 

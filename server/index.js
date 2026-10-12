@@ -25,6 +25,15 @@ app.use(cors({
 app.use(express.json());
 app.use(cookieParser());
 
+// HTTP Defense-in-Depth Security Headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https:; connect-src 'self' http://localhost:5000 http://localhost:5173 ws://localhost:5173 https://mediflow-web-3q7j.onrender.com;");
+  next();
+});
+
 // Real-time SSE Clients
 let sseClients = [];
 
@@ -242,6 +251,8 @@ app.get('/api/health/database', async (req, res) => {
     mode: dbStatus.connected ? 'postgresql' : (dbStatus.configured ? 'error' : 'in-memory-fallback'),
     database: dbStatus.database || null,
     serverTime: dbStatus.serverTime || null,
+    stage: dbStatus.stage || (dbStatus.connected ? 'connected' : 'unknown'),
+    code: dbStatus.code || null,
     error: dbStatus.connected ? null : (dbStatus.error || dbStatus.reason || 'Database unavailable')
   });
 });
@@ -449,6 +460,8 @@ app.get('/api/auth/me', async (req, res) => {
 
 // 1. Request Password Reset (Send 6-digit OTP)
 app.post('/api/auth/forgot-password', async (req, res) => {
+  const reqStart = Date.now();
+  const reqIso = new Date().toISOString();
   try {
     const { email } = req.body;
     if (!email || typeof email !== 'string') {
@@ -461,9 +474,16 @@ app.post('/api/auth/forgot-password', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Please enter a valid email address format.' });
     }
 
+    const masked = cleanEmail.replace(/(.{3}).*(@.*)/, '$1***$2');
+    console.log(`[OTP-Trace] [${reqIso}] 📥 Request received for: ${masked}`);
+
     // Rate Limiting: Max 3 requests per 15 minutes per email
+    const tRateStart = Date.now();
     const allowed = await dbService.checkResetRateLimit(cleanEmail, 3, 15);
+    const rateCheckMs = Date.now() - tRateStart;
+
     if (!allowed) {
+      console.warn(`[OTP-Trace] [${new Date().toISOString()}] ⚠️ Rate limited for: ${masked} (Checked in ${rateCheckMs}ms)`);
       return res.status(429).json({
         success: false,
         message: 'Too many recovery attempts. For your security, please wait 15 minutes before requesting another code.'
@@ -471,44 +491,72 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     }
 
     // Check user existence
+    const tUserStart = Date.now();
     const user = await dbService.findUserByEmailOrPhone(cleanEmail);
+    const userLookupMs = Date.now() - tUserStart;
+
     if (!user) {
-      // Return generic 200 response to prevent email enumeration
+      console.log(`[OTP-Trace] [${new Date().toISOString()}] ℹ️ Non-existent email requested (Anti-enumeration triggered in ${userLookupMs}ms)`);
       return res.status(200).json({
         success: true,
         message: 'If an account exists with this email, a 6-digit verification code has been sent.'
       });
     }
 
-    // Generate cryptographically secure 6-digit numeric OTP
+    // Generate cryptographically secure 6-digit numeric OTP with 15-minute expiry
+    const tGenStart = Date.now();
     const otp = crypto.randomInt(100000, 1000000).toString();
     const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5-minute expiry
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15-minute expiry to safeguard against SMTP delivery queueing
     const resetId = `rst-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    const genMs = Date.now() - tGenStart;
+    console.log(`[OTP-Trace] [${new Date().toISOString()}] 🔑 6-digit OTP generated & hashed in ${genMs}ms. Valid until: ${expiresAt.toISOString()}`);
 
+    // Persist reset record
+    const tDbStart = Date.now();
     await dbService.createPasswordReset({
       id: resetId,
       email: user.email,
       otpHash,
       expiresAt
     });
+    const dbSaveMs = Date.now() - tDbStart;
+    console.log(`[OTP-Trace] [${new Date().toISOString()}] 💾 Reset record saved to storage in ${dbSaveMs}ms (ID: ${resetId})`);
 
     // Send email using real SMTP transporter if configured or dev console fallback
+    const tMailStart = Date.now();
     try {
-      await sendPasswordResetOtpEmail({
+      console.log(`[OTP-Trace] [${new Date().toISOString()}] 🚀 Submitting OTP email to Brevo SMTP relay...`);
+      const dispatchResult = await sendPasswordResetOtpEmail({
         to: user.email,
         otp,
         name: user.name
       });
-    } catch (mailErr) {
-      console.error('[Auth] Failed to dispatch password reset email:', mailErr.message);
-      if (process.env.NODE_ENV === 'production') {
-        return res.status(500).json({
-          success: false,
-          message: 'Unable to deliver verification email at this moment. Please contact support.'
-        });
+      const mailMs = Date.now() - tMailStart;
+      console.log(`[OTP-Trace] [${new Date().toISOString()}] 🏁 Brevo relay submission finished in ${mailMs}ms.`);
+      console.log(`[OTP-Trace]    └─ Mode: ${dispatchResult.mode}, Message-ID: ${dispatchResult.messageId || 'N/A'}`);
+      if (dispatchResult.response) {
+        console.log(`[OTP-Trace]    └─ Server Response: ${dispatchResult.response}`);
       }
+    } catch (mailErr) {
+      const mailFailMs = Date.now() - tMailStart;
+      console.error(`[OTP-Trace] [${new Date().toISOString()}] ❌ Failed to dispatch email after ${mailFailMs}ms:`, mailErr.message);
+      // Clean up the pending reset attempt so failed dispatch doesn't consume rate limit attempts!
+      try {
+        await dbService.deletePasswordReset(resetId);
+      } catch (cleanupErr) {
+        console.error('[Auth] Error rolling back reset attempt:', cleanupErr.message);
+      }
+
+      // Never falsely claim email was sent when delivery failed
+      return res.status(503).json({
+        success: false,
+        message: 'Unable to deliver verification email at this moment. Please verify mail configuration or try again shortly.'
+      });
     }
+
+    const totalMs = Date.now() - reqStart;
+    console.log(`[OTP-Trace] [${new Date().toISOString()}] 📤 HTTP 200 returned to client. Total server processing latency: ${totalMs}ms`);
 
     res.status(200).json({
       success: true,

@@ -26,7 +26,8 @@ export function QueueProvider({ children }) {
   useEffect(() => {
     fetchQueue("doc-1");
 
-    const eventSource = new EventSource('/api/events');
+    const sseBase = (import.meta.env.VITE_API_URL || '/api').replace(/\/+$/, '');
+    const eventSource = new EventSource(`${sseBase}/events`);
 
     eventSource.onopen = () => {
       setIsConnected(true);

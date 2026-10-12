@@ -1,0 +1,64 @@
+name: Deploy MediFlow Web to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'client/**'
+      - '.github/workflows/deploy-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: 'pages'
+  cancel-in-progress: false
+
+jobs:
+  validate-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js (Node 22 for Vite 8 compatibility)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install client dependencies
+        run: npm --prefix client ci
+
+      - name: Run client linter
+        run: npm --prefix client run lint
+
+      - name: Build client for GitHub Pages
+        run: |
+          npm --prefix client run build
+          cp client/dist/index.html client/dist/404.html
+        env:
+          GITHUB_PAGES: 'true'
+          VITE_BASE_PATH: '/mediflow/'
+          VITE_API_URL: 'https://mediflow-web-3q7j.onrender.com/api'
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: client/dist
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: validate-and-build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

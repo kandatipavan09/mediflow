@@ -1,6 +1,6 @@
 // DOCBEE Centralized REST API client with credentials support
 
-const API_BASE = '/api';
+const API_BASE = (import.meta.env.VITE_API_URL || '/api').replace(/\/+$/, '');
 
 export const api = {
   // Authentication

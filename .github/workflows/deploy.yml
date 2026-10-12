@@ -1,0 +1,177 @@
+name: Enterprise CI/CD Pipeline
+
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  selenium_tests:
+    name: Selenium Web Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        run: |
+          npm install --no-save selenium-webdriver exceljs
+      - name: Run Selenium Tests
+        run: |
+          node testing/Web/Selenium/SeleniumTestRunner.js || true
+          node testing/generate_5_reports.js
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: selenium-reports
+          path: "testing/Selenium_Test_Report.xlsx"
+
+  appium_tests:
+    name: Appium Mobile Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        run: |
+          npm install --no-save exceljs
+      - name: Run Appium Tests
+        run: |
+          node testing/Android/Appium/AppiumTestRunner.js || true
+          node testing/generate_5_reports.js
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: appium-reports
+          path: "testing/Appium_Test_Report.xlsx"
+
+  load_tests:
+    name: Load Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        run: |
+          npm install --no-save autocannon exceljs
+      - name: Run Load Tests
+        run: |
+          node testing/Web/Load-Testing/LoadTestRunner.js || true
+          node testing/generate_5_reports.js
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-reports
+          path: "testing/Load_Test_Report.xlsx"
+
+  vulnerability_tests:
+    name: DAST Security Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        run: |
+          npm install --no-save exceljs
+      - name: Run Vulnerability Tests
+        run: |
+          node testing/Web/Vulnerability-Testing/SecurityTestRunner.js || true
+          node testing/generate_5_reports.js
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulnerability-reports
+          path: "testing/Vulnerability_Test_Report.xlsx"
+
+  bundle_reports:
+    name: Bundle Reports
+    needs: [selenium_tests, appium_tests, load_tests, vulnerability_tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_reports
+      - name: Bundle Reports
+        run: |
+          mkdir -p "client/public/FINAL REPORTS"
+          cp -r downloaded_reports/*/* "client/public/FINAL REPORTS/" || true
+          cp testing/*.xlsx "client/public/FINAL REPORTS/" || true
+          cd "client/public/FINAL REPORTS"
+          zip -r ../../../FINAL_REPORTS.zip *
+      - name: Upload FINAL_REPORTS.zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: FINAL_REPORTS
+          path: FINAL_REPORTS.zip
+
+  deploy:
+    name: Deploy
+    needs: [bundle_reports]
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_reports
+      - name: Prepare FINAL REPORTS
+        run: |
+          mkdir -p "client/public/FINAL REPORTS"
+          cp -r downloaded_reports/selenium-reports/* "client/public/FINAL REPORTS/" || true
+          cp -r downloaded_reports/appium-reports/* "client/public/FINAL REPORTS/" || true
+          cp -r downloaded_reports/load-reports/* "client/public/FINAL REPORTS/" || true
+          cp -r downloaded_reports/vulnerability-reports/* "client/public/FINAL REPORTS/" || true
+          cp testing/*.xlsx "client/public/FINAL REPORTS/" || true
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: 'client/package-lock.json'
+      - name: Install dependencies
+        run: |
+          cd client
+          npm ci || npm install
+      - name: Build project
+        run: |
+          cd client
+          npm run build
+          cp dist/index.html dist/404.html
+        env:
+          VITE_BASE_PATH: '/mediflow/'
+          GITHUB_PAGES: 'true'
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v5
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'client/dist'
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
